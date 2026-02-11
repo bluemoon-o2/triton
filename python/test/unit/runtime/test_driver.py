@@ -4,7 +4,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton.backends.driver import expand_signature, wrap_descriptors
+from triton.backends.driver import expand_signature, wrap_handle_tensordesc_impl
 
 
 def test_is_lazy():
@@ -69,7 +69,7 @@ def test_expand_signature_with_aggregate_tensordesc():
     assert expanded[2:] == ["nvTmaDesc", "i32", "i32", "i32", "i32", "i64", "i64", "i64", "i64"]
 
 
-def test_wrap_descriptors_handles_aggregate_arguments():
+def test_wrap_tensordesc_handles_aggregate_arguments():
     signature = {0: ("tensordesc<fp16[16,16]>", "i32"), 1: "i64", 2: "tensordesc<fp16[16,16]>"}
     outer_meta = {"tag": "outer"}
     launcher_calls = []
@@ -81,24 +81,24 @@ def test_wrap_descriptors_handles_aggregate_arguments():
     def make_descriptor(arg, meta, base_args):
         return [("desc", arg, meta, base_args[0]), ("shape", arg)]
 
-    wrapped = wrap_descriptors(launcher, signature, [None, outer_meta], make_descriptor)
+    wrapped = wrap_handle_tensordesc_impl(launcher, signature, [None, outer_meta], make_descriptor)
     assert wrapped("meta0", "meta1", (("A", 7), 9, "B")) == "ok"
 
     assert len(launcher_calls) == 1
     assert launcher_calls[0][0] == "meta0"
     assert launcher_calls[0][1] == "meta1"
-    assert launcher_calls[0][2] == (
+    assert launcher_calls[0][2] == [
         (("desc", "A", None, "meta0"), ("shape", "A"), 7),
         9,
         ("desc", "B", outer_meta, "meta0"),
         ("shape", "B"),
-    )
+    ]
 
 
-def test_wrap_descriptors_is_noop_without_tensordesc():
+def test_wrap_tensordesc_is_noop_without_tensordesc():
 
     def launcher(*args):
         return args
 
-    wrapped = wrap_descriptors(launcher, {0: "i32", 1: ("i64", "constexpr")}, None, lambda *_: [])
+    wrapped = wrap_handle_tensordesc_impl(launcher, {0: "i32", 1: ("i64", "constexpr")}, None, lambda *_: [])
     assert wrapped is launcher

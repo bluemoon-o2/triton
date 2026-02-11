@@ -1,9 +1,9 @@
 from abc import ABCMeta, abstractmethod
 import re
 from typing import Callable, List, Protocol, Sequence
-from collections import defaultdict
 
 from triton._utils import find_paths_if
+from triton._C.libtriton import make_tensordesc_args
 
 
 def decompose_descriptor(arg):
@@ -16,48 +16,25 @@ def _is_descriptor(arg):
     return isinstance(arg, str) and arg.startswith("tensordesc")
 
 
-def _make_tensordesc_args(args, signature, relevant_paths, tensordesc_meta, base_args, make_tensordesc_arg):
-
-    def visit(arg, sig, relevant_paths, tensordesc_idx, result):
-        for i, (a, s) in enumerate(zip(arg, sig)):
-            rel_paths = relevant_paths.get(i, None)
-            if rel_paths is None:
-                result.append(a)
-            elif len(rel_paths) == 0:
-                meta = tensordesc_meta[tensordesc_idx] if tensordesc_meta else None
-                result.extend(make_tensordesc_arg(a, meta, base_args))
-                tensordesc_idx += 1
-            else:
-                inner_res = []
-                tensordesc_idx = visit(a, s, rel_paths, tensordesc_idx, inner_res)
-                result.append(tuple(inner_res))
-        return tensordesc_idx
-
-    result = []
-    tensordesc_idx = visit(args, signature, relevant_paths, 0, result)
-    assert not tensordesc_meta or tensordesc_idx == len(tensordesc_meta)
-    return result
-
-
 def wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg):
-    signature = tuple(signature.values()) if hasattr(signature, "values") else tuple(signature)
+    signature = tuple(signature.values())
     tensordesc_paths = find_paths_if(signature, lambda _, x: _is_descriptor(x))
     if len(tensordesc_paths) == 0:
         return launcher
 
-    # Build a tree to speed up checking, it will look like:
-    # signature = ['tensordesc', 'i32', ('i32', 'tensordesc')]
+    # Build a tree to speed up tensordesc type checking, e.g.
+    # signature = ('tensordesc', 'i32', ('i32', 'tensordesc'))
     # relevant_paths = {0: {}, 2: {1: {}}}
-    relevant_paths = defaultdict(defaultdict)
+    relevant_paths = {}
     for path in tensordesc_paths:
         cur = relevant_paths
         for step in path:
-            cur = cur[step]
+            cur = cur.setdefault(step, {})
 
     def inner(*args):
         base_args = args[:-1]
         kernel_args = args[-1]
-        wrapped = _make_tensordesc_args(
+        wrapped = make_tensordesc_args(
             kernel_args,
             signature,
             relevant_paths,
