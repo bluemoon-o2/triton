@@ -714,11 +714,11 @@ PyObject *make_tensordesc_args(PyObject *self, PyObject *const *args,
   PyObject *base_args = args[4];
   PyObject *make_tensordesc_arg = args[5];
 
-  bool has_tensordesc_meta = tensordesc_meta != Py_None;
-  if (has_tensordesc_meta && !PyList_CheckExact(tensordesc_meta)) {
+  if (!PyList_CheckExact(tensordesc_meta)) {
     PyErr_SetString(PyExc_TypeError, "Expected tensordesc_meta to be a list");
     return nullptr;
   }
+  bool has_tensordesc_meta = PyList_GET_SIZE(tensordesc_meta) > 0;
 
   auto result = from_new_ref(PyList_New(0));
   if (!result)

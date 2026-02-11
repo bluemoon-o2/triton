@@ -60,13 +60,13 @@ def _parse_descriptor(descriptor):
     return (dtype, ndim)
 
 
-def _expand_descriptor(descriptor, meta, descriptor_type):
+def _expand_descriptor(descriptor, has_tensordesc_meta, descriptor_type):
     dtype, ndim = _parse_descriptor(descriptor)
     expanded = []
 
     # If there is no descriptor metadata, the descriptor was decomposed to:
     # base pointer, shape, strides, padding, round_f32_to_tf32.
-    if meta is None:
+    if not has_tensordesc_meta:
         expanded.append("*" + dtype)
         for _ in range(2 * ndim):
             expanded.append("i64")
@@ -83,11 +83,13 @@ def _expand_descriptor(descriptor, meta, descriptor_type):
 
 
 def expand_signature(signature, tensordesc_meta, descriptor_type):
+    has_tensordesc_meta = bool(tensordesc_meta)
+
     result = []
 
     def visit(signature, result):
         if _is_descriptor(signature):
-            result.extend(_expand_descriptor(signature, tensordesc_meta, descriptor_type))
+            result.extend(_expand_descriptor(signature, has_tensordesc_meta, descriptor_type))
             return
         elif isinstance(signature, tuple):
             inner = []

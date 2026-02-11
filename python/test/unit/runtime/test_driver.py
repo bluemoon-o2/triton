@@ -48,25 +48,17 @@ def test_expand_signature_with_aggregate_tensordesc():
         ("tensordesc<fp16[16,32]>", "i64"),
         "tensordesc_im2col<fp32[1,16],input_rank=4,'layout'>",
     )
-    expanded = expand_signature(signature, [None, {"lowered": True}], "nvTmaDesc")
+    expanded = expand_signature(signature, [], "nvTmaDesc")
 
     assert expanded[0] == "i32"
-    assert expanded[1] == (
-        "*fp16",
-        "i64",
-        "i64",
-        "i64",
-        "i64",
-        "i1",
-        "i1",
-        "i32",
-        "i32",
-        "i64",
-        "i64",
-        "i64",
-    )
+    assert expanded[1] == ("*fp16", *["i64"] * 4, *["i1"] * 2, *["i32"] * 2, *["i64"] * 3)
     # input_rank=4 drives the number of shape/stride entries for im2col.
-    assert expanded[2:] == ["nvTmaDesc", "i32", "i32", "i32", "i32", "i64", "i64", "i64", "i64"]
+    assert expanded[2:] == ["*fp32", *["i64"] * 8, *["i1"] * 2, *["i32"] * 4, *["i64"] * 4]
+
+    expanded = expand_signature(signature, [{}, {}], "nvTmaDesc")
+    assert expanded[0] == "i32"
+    assert expanded[1] == ("nvTmaDesc", *["i32"] * 2, *["i64"] * 3)
+    assert expanded[2:] == ["nvTmaDesc", *["i32"] * 4, *["i64"] * 4]
 
 
 def test_wrap_tensordesc_handles_aggregate_arguments():
