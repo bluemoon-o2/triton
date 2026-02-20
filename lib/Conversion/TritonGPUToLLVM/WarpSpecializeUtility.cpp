@@ -345,10 +345,11 @@ static void disableLICM(LLVM::BrOp latchBr) {
 // lowerWarpSpecializeCommon
 //===----------------------------------------------------------------------===//
 
-static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
+static void rewritePartitionRegions(WarpSpecializeOp ws,
                                     const TargetInfoBase &targetInfo,
                                     const WarpSpecializeCallbacks &callbacks,
-                                    unsigned switchLoopBarrierIdx) {
+                                    unsigned switchLoopBarrierIdx,
+                                    Block *workerReturnTarget) {
   TritonLLVMIRRewriter b(ws.getLoc(), ws.getContext());
   for (Region *partition : ws.getPartitionRegions()) {
     // Load the explicit captures from shared memory and replace the block args
@@ -389,7 +390,7 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
       callbacks.reallocRegisters(b, ws,
                                  RegisterReallocPhase::WorkerPartitionEnd,
                                  partition->getRegionNumber());
-      b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
+      b.replaceOpWithNewOp<LLVM::BrOp>(op, workerReturnTarget);
     });
   }
 }
@@ -404,6 +405,7 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   TritonLLVMIRRewriter b(func.getLoc(), ctx);
   Type int8Type = b.getIntegerType(8);
   LLVM::LLVMPointerType ptrTy = ptr_ty(ctx, 3);
+  Block *switchExit = new Block;
 
   b.setInsertionPointToStart(switchLoop);
   callbacks.reallocRegisters(b, wsOps[0], RegisterReallocPhase::SwitchLoopStart,
@@ -436,8 +438,10 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   for (size_t i = 0; i < wsOps.size(); ++i) {
     WarpSpecializeOp op = wsOps[i];
     auto &stateMap = warpToState[i];
-    rewritePartitionRegions(op, switchLoop, targetInfo, callbacks,
-                            switchLoopBarrierIdx);
+    Block *workerReturnTarget =
+        i + 1 == wsOps.size() ? switchExit : switchLoop;
+    rewritePartitionRegions(op, targetInfo, callbacks, switchLoopBarrierIdx,
+                            workerReturnTarget);
     for (auto [partition, partitionNumWarps, startId] :
          llvm::zip(op.getPartitionRegions(), op.getPartitionNumWarps(),
                    *op.getWarpGroupStartIds())) {
@@ -446,6 +450,19 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
       for (int32_t &stateId : MutableArrayRef(stateMap).slice(
                startId - defaultNumWarps, partitionNumWarps))
         stateId = partitionStates.back();
+    }
+  }
+
+  std::optional<int32_t> finalDefaultState;
+  if (!warpToState.empty()) {
+    auto &lastStateMap = warpToState.back();
+    bool hasUnassignedWorker =
+        llvm::any_of(lastStateMap, [](int32_t state) { return state == -1; });
+    if (hasUnassignedWorker) {
+      finalDefaultState = partitionStateCounter++;
+      for (int32_t &state : lastStateMap)
+        if (state == -1)
+          state = *finalDefaultState;
     }
   }
 
@@ -472,8 +489,17 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   disableLICM(latchBr);
 
   // Exit state.
-  Block *switchExit = new Block;
   funcBlocks.insert(std::next(defaultBlock->getIterator()), switchExit);
+  if (finalDefaultState) {
+    Block *finalDefaultBlock = new Block;
+    funcBlocks.insert(std::next(defaultBlock->getIterator()), finalDefaultBlock);
+    b.setInsertionPointToStart(finalDefaultBlock);
+    callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+    callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+    LLVM::BrOp::create(b, b.getLoc(), switchExit);
+    partitionBlocks.push_back(finalDefaultBlock);
+    partitionStates.push_back(*finalDefaultState);
+  }
   partitionBlocks.push_back(switchExit);
   partitionStates.push_back(partitionStateCounter);
 
@@ -553,7 +579,6 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     Value cst = b.i8_val(partitionStateCounter);
     for (int32_t i : llvm::seq(maxNumWarps))
       b.store(cst, b.gep(ptrTy, int8Type, statePtrExit, LLVM::GEPArg(i)));
-    callbacks.createAllBarrier(b, switchLoopBarrierIdx);
   });
   b.setInsertionPointToStart(switchExit);
   LLVM::ReturnOp::create(b, b.getLoc(), ValueRange());
