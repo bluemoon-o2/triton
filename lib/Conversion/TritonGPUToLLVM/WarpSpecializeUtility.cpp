@@ -595,6 +595,8 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     Value cst = b.i8_val(partitionStateCounter);
     for (int32_t i : llvm::seq(maxNumWarps))
       b.store(cst, b.gep(ptrTy, int8Type, statePtrExit, LLVM::GEPArg(i)));
+    if (!skipFinalJoinOnReturn)
+      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
   });
   b.setInsertionPointToStart(switchExit);
   LLVM::ReturnOp::create(b, b.getLoc(), ValueRange());
