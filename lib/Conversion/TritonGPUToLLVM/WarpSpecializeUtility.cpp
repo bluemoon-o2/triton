@@ -349,7 +349,8 @@ static void rewritePartitionRegions(WarpSpecializeOp ws,
                                     const TargetInfoBase &targetInfo,
                                     const WarpSpecializeCallbacks &callbacks,
                                     unsigned switchLoopBarrierIdx,
-                                    Block *workerReturnTarget) {
+                                    Block *workerReturnTarget,
+                                    bool joinAtWorkerExit) {
   TritonLLVMIRRewriter b(ws.getLoc(), ws.getContext());
   for (Region *partition : ws.getPartitionRegions()) {
     // Load the explicit captures from shared memory and replace the block args
@@ -386,10 +387,12 @@ static void rewritePartitionRegions(WarpSpecializeOp ws,
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
-      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-      callbacks.reallocRegisters(b, ws,
-                                 RegisterReallocPhase::WorkerPartitionEnd,
-                                 partition->getRegionNumber());
+      if (joinAtWorkerExit) {
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+        callbacks.reallocRegisters(b, ws,
+                                   RegisterReallocPhase::WorkerPartitionEnd,
+                                   partition->getRegionNumber());
+      }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, workerReturnTarget);
     });
   }
@@ -434,14 +437,23 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   int32_t maxNumWarps = totalNumWarps - defaultNumWarps;
   SmallVector<SmallVector<int32_t>> warpToState(
       wsOps.size(), SmallVector<int32_t>(maxNumWarps, -1));
+  bool skipFinalJoinOnReturn = false;
+  if (!wsOps.empty()) {
+    WarpSpecializeOp lastWs = wsOps.back();
+    auto nextIt = std::next(lastWs->getIterator());
+    skipFinalJoinOnReturn =
+        nextIt != lastWs->getBlock()->end() && isa<LLVM::ReturnOp>(*nextIt) &&
+        std::next(nextIt) == lastWs->getBlock()->end();
+  }
 
   for (size_t i = 0; i < wsOps.size(); ++i) {
     WarpSpecializeOp op = wsOps[i];
     auto &stateMap = warpToState[i];
-    Block *workerReturnTarget =
-        i + 1 == wsOps.size() ? switchExit : switchLoop;
+    bool skipJoinForThisWs = i + 1 == wsOps.size() && skipFinalJoinOnReturn;
+    Block *workerReturnTarget = skipJoinForThisWs ? switchExit : switchLoop;
+    bool joinAtWorkerExit = !skipJoinForThisWs;
     rewritePartitionRegions(op, targetInfo, callbacks, switchLoopBarrierIdx,
-                            workerReturnTarget);
+                            workerReturnTarget, joinAtWorkerExit);
     for (auto [partition, partitionNumWarps, startId] :
          llvm::zip(op.getPartitionRegions(), op.getPartitionNumWarps(),
                    *op.getWarpGroupStartIds())) {
@@ -454,7 +466,7 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   }
 
   std::optional<int32_t> finalDefaultState;
-  if (!warpToState.empty()) {
+  if (!warpToState.empty() && skipFinalJoinOnReturn) {
     auto &lastStateMap = warpToState.back();
     bool hasUnassignedWorker =
         llvm::any_of(lastStateMap, [](int32_t state) { return state == -1; });
@@ -495,7 +507,6 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     funcBlocks.insert(std::next(defaultBlock->getIterator()), finalDefaultBlock);
     b.setInsertionPointToStart(finalDefaultBlock);
     callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-    callbacks.createAllBarrier(b, switchLoopBarrierIdx);
     LLVM::BrOp::create(b, b.getLoc(), switchExit);
     partitionBlocks.push_back(finalDefaultBlock);
     partitionStates.push_back(*finalDefaultState);
@@ -518,6 +529,8 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     auto &stateMap = warpToState[i];
     Block *before = ws->getBlock();
     Block *after = b.splitBlock(before, ws->getIterator());
+    bool skipJoinForThisWs = i + 1 == wsOps.size() && skipFinalJoinOnReturn;
+    bool restoreDefaultRegistersAtExit = !skipJoinForThisWs;
     TritonLLVMIRRewriter b(ws.getLoc(), OpBuilder::atBlockEnd(before));
     Type int8Type = b.getIntegerType(8);
     Value statePtrWs =
@@ -554,9 +567,12 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
 
     ws.getDefaultRegion().walk([&, ws = ws](WarpYieldOp op) mutable {
       TritonLLVMIRRewriter b(op.getLoc(), op);
-      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-      callbacks.reallocRegisters(b, ws,
-                                 RegisterReallocPhase::DefaultPartitionEnd, 0);
+      if (!skipJoinForThisWs)
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+      if (restoreDefaultRegistersAtExit) {
+        callbacks.reallocRegisters(b, ws,
+                                   RegisterReallocPhase::DefaultPartitionEnd, 0);
+      }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, op.getOperands(), after);
     });
     after->getParent()->getBlocks().splice(after->getIterator(),
